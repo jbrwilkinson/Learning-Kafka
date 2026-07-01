@@ -1,0 +1,75 @@
+name: Build and test Kafka environment
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate compose file
+        run: docker compose config -q
+
+      - name: Build producer and consumer images
+        run: docker compose build
+
+      - name: Start the stack
+        run: docker compose up -d
+
+      - name: Wait for topic creation (kafka-init)
+        run: |
+          timeout 180 bash -c '
+            until [ "$(docker inspect -f "{{.State.ExitCode}}" kafka-init 2>/dev/null)" = "0" ]; do
+              sleep 3
+            done
+          '
+          docker compose logs kafka-init
+
+      - name: Verify topics were created with expected partitions/replication
+        run: |
+          docker compose exec -T kafka1 kafka-topics \
+            --bootstrap-server kafka1:9092 --describe --topic events | tee /tmp/events-describe.txt
+          grep -q "PartitionCount: 6" /tmp/events-describe.txt
+          grep -q "ReplicationFactor: 3" /tmp/events-describe.txt
+
+      - name: Wait for producer -> consumer message flow
+        run: |
+          timeout 120 bash -c '
+            until docker compose logs consumer 2>/dev/null | grep -q "Received partition"; do
+              sleep 3
+            done
+          '
+
+      - name: Wait for consumer lag reporting
+        run: |
+          timeout 60 bash -c '
+            until docker compose logs consumer 2>/dev/null | grep -q "\[LAG\]"; do
+              sleep 3
+            done
+          '
+
+      - name: Cross-check lag against kafka-consumer-groups
+        run: |
+          docker compose exec -T kafka1 kafka-consumer-groups \
+            --bootstrap-server kafka1:9092 --describe --group learning-consumer-group
+
+      - name: Check Kafka UI is reachable
+        run: |
+          timeout 60 bash -c '
+            until curl -sf -o /dev/null http://localhost:8080/; do
+              sleep 3
+            done
+          '
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
